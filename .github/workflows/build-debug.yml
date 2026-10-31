@@ -18,22 +18,17 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Set up Android SDK (self-contained)
+      - name: Set up Android SDK (best effort)
         continue-on-error: true
         run: |
-          set -x
-          mkdir -p "$RUNNER_TEMP/sdk/cmdline-tools"
-          wget -q https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip -O "$RUNNER_TEMP/cmdtools.zip"
-          unzip -q "$RUNNER_TEMP/cmdtools.zip" -d "$RUNNER_TEMP/sdk/cmdline-tools"
-          mv "$RUNNER_TEMP/sdk/cmdline-tools/cmdline-tools" "$RUNNER_TEMP/sdk/cmdline-tools/latest"
-          echo "ANDROID_HOME=$RUNNER_TEMP/sdk" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$RUNNER_TEMP/sdk" >> "$GITHUB_ENV"
-          export ANDROID_HOME="$RUNNER_TEMP/sdk"
-          export ANDROID_SDK_ROOT="$RUNNER_TEMP/sdk"
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > "$RUNNER_TEMP/licenses.log" 2>&1 || true
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "platform-tools" "platforms;android-37" "build-tools;37.0.0" > "$RUNNER_TEMP/sdk-install.log" 2>&1 || true
-          tail -40 "$RUNNER_TEMP/sdk-install.log" | while IFS= read -r line; do echo "::warning::$line"; done
-          ls "$ANDROID_HOME/platforms" 2>/dev/null || echo "::error::platforms dir missing"
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMANAGER="sdkmanager"
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" "platforms;android-37" "build-tools;37.0.0" > "$RUNNER_TEMP/sdk-install.log" 2>&1 || true
+          echo "::notice::SDK dirs: $(ls "$ANDROID_HOME/platforms" 2>/dev/null | tr '\n' ' ')"
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
@@ -46,7 +41,8 @@ jobs:
             tail -80 "$RUNNER_TEMP/gradle-build.log" | while IFS= read -r line; do echo "::error::$line"; done
           else
             echo "::notice::GRADLE BUILD OK"
-            tail -15 "$RUNNER_TEMP/gradle-build.log" | while IFS= read -r line; do echo "::notice::$line"; done
+            find . -name "*.apk" -type f -exec stat -c '::notice::APK %n %s bytes' {} \;
+            tail -10 "$RUNNER_TEMP/gradle-build.log" | while IFS= read -r line; do echo "::notice::$line"; done
           fi
           exit $exit_code
 
@@ -56,8 +52,7 @@ jobs:
         with:
           name: band-health-sync-build
           path: |
-            app/build/outputs/apk/debug/*.apk
+            **/*.apk
             ${{ runner.temp }}/sdk-install.log
-            ${{ runner.temp }}/licenses.log
             ${{ runner.temp }}/gradle-build.log
           retention-days: 30
