@@ -26,8 +26,16 @@ import androidx.work.Worker
 import androidx.work.WorkerParameters
 import nodomain.freeyourgadget.gadgetbridge.GBApplication
 import nodomain.freeyourgadget.gadgetbridge.R
+import nodomain.freeyourgadget.gadgetbridge.devices.TimeSampleProvider
 import nodomain.freeyourgadget.gadgetbridge.impl.GBDevice
 import nodomain.freeyourgadget.gadgetbridge.model.ActivitySample
+import nodomain.freeyourgadget.gadgetbridge.model.BodyEnergySample
+import nodomain.freeyourgadget.gadgetbridge.model.HeartRateSample
+import nodomain.freeyourgadget.gadgetbridge.model.PaiSample
+import nodomain.freeyourgadget.gadgetbridge.model.Spo2Sample
+import nodomain.freeyourgadget.gadgetbridge.model.StressSample
+import nodomain.freeyourgadget.gadgetbridge.model.TemperatureSample
+import nodomain.freeyourgadget.gadgetbridge.model.TimeSample
 import nodomain.freeyourgadget.gadgetbridge.util.GBPrefs
 import nodomain.freeyourgadget.gadgetbridge.util.cycle.CycleContextStore
 import nodomain.freeyourgadget.gadgetbridge.util.cycle.CycleContextSyncWorker
@@ -43,6 +51,10 @@ import java.util.concurrent.TimeUnit
 
 /**
  * Reads the samples Gadgetbridge already stores and posts them to the user's own health server.
+ *
+ * Everything the band stored is uploaded as-is: activity samples (steps, heart rate, sleep) plus
+ * the time-series providers (stress, SpO2, resting heart rate, temperature, body energy, PAI),
+ * each point keeping the band's own timestamp and value. No averaging, no downsampling.
  *
  * Replaces the Health Connect -> third party webhook chain for that one destination: same data, one
  * process, no Google component in the path. The Health Connect sync is untouched and stays useful
@@ -107,13 +119,17 @@ class SelfHostedHealthSyncWorker(
 
             // Reading and packaging share one guard: neither should be able to throw past doWork,
             // or WorkManager records a bare failure and this screen keeps showing the stale status.
-            val samples: List<ActivitySample>
             val payload: SelfHostedHealthPayloadSet
             try {
-                samples = readSamples(device, windowStart, now)
-                val legacy = SelfHostedHealthPayload.build(samples, zone, sleepCursor, now)
+                val samples = readSamples(device, windowStart, now)
+                val timeSeries = readTimeSamples(device, windowStart, now)
+                var built = SelfHostedHealthPayload.build(samples, zone, sleepCursor, now)
+                for ((key, points) in timeSeries) {
+                    val days = SelfHostedHealthPayload.attachTimeSamples(built.days, key, points, zone)
+                    built = SelfHostedHealthPayloadSet(days, built.sleepUploadedThrough)
+                }
                 payload = SelfHostedWorkoutSync.attach(
-                    legacy, { SelfHostedWorkoutReader.read(device, windowStart, now) }, zone, now,
+                    built, { SelfHostedWorkoutReader.read(device, windowStart, now) }, zone, now,
                     prefs.getBoolean(GBPrefs.SELF_HOSTED_HEALTH_WORKOUTS_ENABLED, false)
                 )
             } catch (e: Exception) {
@@ -124,8 +140,8 @@ class SelfHostedHealthSyncWorker(
             }
 
             LOG.info(
-                "Self-hosted health sync for {}: {} sample(s) from {} produced {} day payload(s)",
-                address, samples.size, Instant.ofEpochSecond(windowStart), payload.days.size
+                "Self-hosted health sync for {}: {} day payload(s) from {}",
+                address, payload.days.size, Instant.ofEpochSecond(windowStart)
             )
 
             var allSucceeded = true
@@ -203,6 +219,61 @@ class SelfHostedHealthSyncWorker(
         }
     }
 
+    /**
+     * Reads every time-series provider the coordinator exposes (stress, SpO2, resting HR,
+     * temperature, body energy, PAI) for the window and returns the raw points by JSON key.
+     * TimeSampleProvider works in milliseconds; points are converted to epoch seconds to match the
+     * rest of the payload. Values that are absent or not measured are dropped; everything else is
+     * kept untouched.
+     */
+    private fun readTimeSamples(device: GBDevice, fromTs: Long, toTs: Long): Map<String, List<TimeSamplePoint>> {
+        val fromMs = fromTs * 1000L
+        val toMs = toTs * 1000L
+        val result = mutableMapOf<String, List<TimeSamplePoint>>()
+        GBApplication.acquireDbReadOnly().use { db ->
+            val session = db.daoSession
+            val coordinator = device.deviceCoordinator
+
+            fun readSeries(key: String, provider: TimeSampleProvider<*>?, valueOf: (TimeSample) -> Float?) {
+                if (provider == null) {
+                    return
+                }
+                @Suppress("UNCHECKED_CAST")
+                val samples = (provider as TimeSampleProvider<TimeSample>).getAllSamples(fromMs, toMs)
+                val points = mutableListOf<TimeSamplePoint>()
+                for (sample in samples) {
+                    val value = valueOf(sample)
+                    if (value != null && value > 0f) {
+                        points.add(TimeSamplePoint(sample.timestamp / 1000L, value))
+                    }
+                }
+                if (points.isNotEmpty()) {
+                    result[key] = points
+                }
+            }
+
+            readSeries("stress", coordinator.getStressSampleProvider(device, session)) {
+                (it as? StressSample)?.getStress()?.toFloat()
+            }
+            readSeries("spo2", coordinator.getSpo2SampleProvider(device, session)) {
+                (it as? Spo2Sample)?.getSpo2()?.toFloat()
+            }
+            readSeries("resting_hr", coordinator.getHeartRateRestingSampleProvider(device, session)) {
+                (it as? HeartRateSample)?.getHeartRate()?.toFloat()
+            }
+            readSeries("temperature", coordinator.getTemperatureSampleProvider(device, session)) {
+                (it as? TemperatureSample)?.getTemperature()
+            }
+            readSeries("body_energy", coordinator.getBodyEnergySampleProvider(device, session)) {
+                (it as? BodyEnergySample)?.getEnergy()?.toFloat()
+            }
+            readSeries("pai", coordinator.getPaiSampleProvider(device, session)) {
+                (it as? PaiSample)?.getPaiToday()
+            }
+        }
+        return result
+    }
+
     private fun selectedDevices(prefs: GBPrefs, requestedAddress: String?): List<GBDevice> {
         val selected = prefs.getStringSet(GBPrefs.SELF_HOSTED_HEALTH_DEVICE_SELECTION, emptySet())
             .orEmpty()
@@ -244,12 +315,16 @@ class SelfHostedHealthSyncWorker(
         payload = prettyPayload(day.body)
     )
 
-    /** Steps count as one record; each heart-rate point, sleep session and workout counts on its own. */
+    /** Steps count as one record; each heart-rate point, sleep session, workout and
+     *  time-series point counts on its own. */
     private fun countRecords(body: JSONObject): Int {
         var count = if (body.has("steps")) 1 else 0
         count += body.optJSONArray("heart_rate")?.length() ?: 0
         count += body.optJSONArray("sleep")?.length() ?: 0
         count += body.optJSONArray("workouts")?.length() ?: 0
+        for (key in arrayOf("stress", "spo2", "resting_hr", "temperature", "body_energy", "pai")) {
+            count += body.optJSONArray(key)?.length() ?: 0
+        }
         return count
     }
 

@@ -36,11 +36,19 @@ data class SelfHostedHealthPayloadSet(
     val sleepUploadedThrough: Long
 )
 
+/** One point of a non-activity time series (stress, SpO2, resting HR, ...) read from a
+ *  `TimeSampleProvider`. [timestamp] is epoch seconds; [value] is the raw band reading. */
+data class TimeSamplePoint(val timestamp: Long, val value: Float)
+
 /**
  * Turns raw [ActivitySample]s into the JSON bodies the self-hosted health server ingests.
  *
  * Pure by design (no Android, no database, no network) so the wire format can be unit tested,
  * which is the only genuinely unknown part of the direct-upload path.
+ *
+ * Data is uploaded as the band produced it: heart-rate samples keep their original timestamp and
+ * value (no bucketing, no averaging), and the extra time series attached via [attachTimeSamples]
+ * (stress, SpO2, resting HR, temperature, body energy, PAI) are plain {timestamp, value} points.
  *
  * The server merges rather than overwrites: steps take the larger value, heart rate dedups on the
  * exact timestamp string, and overlapping sleep sessions keep the most complete span. Re-sending
@@ -49,13 +57,6 @@ data class SelfHostedHealthPayloadSet(
  * the shorter server copy (see the settle rule in [build]).
  */
 object SelfHostedHealthPayload {
-    /**
-     * Heart rate is downsampled into buckets of this size and averaged. The server keeps the last
-     * 288 samples of a day and drops the rest, so 5 minutes is exactly the resolution that fills a
-     * day without being truncated.
-     */
-    const val HEART_RATE_BUCKET_SECONDS = 300L
-
     /**
      * A sleep session is only uploaded once its end is this far behind the newest data we hold.
      *
@@ -99,8 +100,8 @@ object SelfHostedHealthPayload {
         val sorted = samples.sortedBy { it.timestamp }
 
         val stepsByDate = LinkedHashMap<LocalDate, Long>()
-        // date -> bucket start -> [bpm sum, sample count]
-        val heartRateByDate = LinkedHashMap<LocalDate, LinkedHashMap<Long, IntArray>>()
+        // date -> raw heart-rate points: (original timestamp, original bpm), no bucketing.
+        val heartRateByDate = LinkedHashMap<LocalDate, MutableList<Pair<Long, Int>>>()
 
         for (sample in sorted) {
             val timestamp = sample.timestamp.toLong()
@@ -112,15 +113,11 @@ object SelfHostedHealthPayload {
             }
 
             // Same validity rule the Health Connect path uses: 255 is Gadgetbridge's documented
-            // "bad measurement" sentinel and 0 means "not measured".
+            // "bad measurement" sentinel and 0 means "not measured". Valid raw readings are
+            // uploaded as-is with their own timestamp.
             val bpm = sample.heartRate
             if (bpm in 1..300 && bpm != 255) {
-                val bucketStart = Math.floorDiv(timestamp, HEART_RATE_BUCKET_SECONDS) * HEART_RATE_BUCKET_SECONDS
-                val accumulator = heartRateByDate
-                    .getOrPut(date) { LinkedHashMap() }
-                    .getOrPut(bucketStart) { IntArray(2) }
-                accumulator[0] += bpm
-                accumulator[1]++
+                heartRateByDate.getOrPut(date) { mutableListOf() }.add(timestamp to bpm)
             }
         }
 
@@ -165,13 +162,13 @@ object SelfHostedHealthPayload {
             stepsByDate[date]?.let { total ->
                 body.put("steps", JSONObject().put("total", total))
             }
-            heartRateByDate[date]?.let { buckets ->
+            heartRateByDate[date]?.let { points ->
                 val array = JSONArray()
-                for ((bucketStart, accumulator) in buckets.entries.sortedBy { it.key }) {
+                for ((ts, bpm) in points) {
                     array.put(
                         JSONObject()
-                            .put("timestamp", formatTimestamp(bucketStart, zone))
-                            .put("value", Math.round(accumulator[0].toDouble() / accumulator[1]))
+                            .put("timestamp", formatTimestamp(ts, zone))
+                            .put("value", bpm)
                     )
                 }
                 body.put("heart_rate", array)
@@ -185,6 +182,47 @@ object SelfHostedHealthPayload {
         }
 
         return SelfHostedHealthPayloadSet(days, newestSleepEnd)
+    }
+
+    /**
+     * Attaches raw points of a non-activity time series (stress, SpO2, resting HR, ...) to the
+     * payload days, bucketing them by local day. Days that only contain points of this series get a
+     * fresh day entry; existing days are merged in place. Points are emitted as
+     * `{timestamp, value}` with the band's own value, untouched.
+     *
+     * @param key the top-level JSON key, e.g. "stress" or "spo2".
+     * @param samples points read from a `TimeSampleProvider`; timestamps in epoch seconds.
+     */
+    @JvmStatic
+    fun attachTimeSamples(
+        days: List<SelfHostedHealthDay>,
+        key: String,
+        samples: List<TimeSamplePoint>,
+        zone: ZoneId
+    ): List<SelfHostedHealthDay> {
+        if (samples.isEmpty()) {
+            return days
+        }
+        val byDate = LinkedHashMap<LocalDate, MutableList<TimeSamplePoint>>()
+        for (point in samples) {
+            byDate.getOrPut(localDate(point.timestamp, zone)) { mutableListOf() }.add(point)
+        }
+        val bodies = LinkedHashMap<String, JSONObject>()
+        for (day in days) {
+            bodies[day.date] = day.body
+        }
+        for ((date, points) in byDate) {
+            val body = bodies.getOrPut(date.toString()) { JSONObject().put("date", date.toString()) }
+            val array = body.optJSONArray(key) ?: JSONArray().also { body.put(key, it) }
+            for (point in points.sortedBy { it.timestamp }) {
+                array.put(
+                    JSONObject()
+                        .put("timestamp", formatTimestamp(point.timestamp, zone))
+                        .put("value", point.value)
+                )
+            }
+        }
+        return bodies.map { (date, body) -> SelfHostedHealthDay(date, body) }
     }
 
     /**
