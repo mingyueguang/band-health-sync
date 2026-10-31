@@ -18,8 +18,15 @@ jobs:
           distribution: temurin
           java-version: '21'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Install Android SDK components
+        run: |
+          if [ -x "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" ]; then
+            SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          else
+            SDKMANAGER="sdkmanager"
+          fi
+          yes | "$SDKMANAGER" --licenses > /dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-37" "build-tools;37.0.0" > /dev/null
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
