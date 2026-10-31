@@ -28,25 +28,34 @@ jobs:
           fi
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" "platforms;android-37" "build-tools;37.0.0" > "$RUNNER_TEMP/sdk-install.log" 2>&1 || true
-          echo "::notice::SDK dirs: $(ls "$ANDROID_HOME/platforms" 2>/dev/null | tr '\n' ' ')"
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build debug APK
+      - name: Build mainline debug APK
         run: |
-          ./gradlew assembleDebug --no-daemon --stacktrace > "$RUNNER_TEMP/gradle-build.log" 2>&1
+          ./gradlew assembleMainlineDebug --no-daemon --stacktrace > "$RUNNER_TEMP/gradle-build.log" 2>&1
           exit_code=$?
           if [ $exit_code -ne 0 ]; then
             tail -80 "$RUNNER_TEMP/gradle-build.log" | while IFS= read -r line; do echo "::error::$line"; done
           else
             echo "::notice::GRADLE BUILD OK"
             find . -name "*.apk" -type f -exec stat -c '::notice::APK %n %s bytes' {} \;
-            tail -10 "$RUNNER_TEMP/gradle-build.log" | while IFS= read -r line; do echo "::notice::$line"; done
           fi
           exit $exit_code
 
-      - name: Upload diagnostics and APK
+      - name: Publish release with APK
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="raw-$(date +%Y%m%d-%H%M%S)"
+          gh release create "$TAG" "app/build/outputs/apk/mainline/debug/app-mainline-debug.apk" \
+            --repo mingyueguang/band-health-sync \
+            --title "band-health-sync 原始数据上传版" \
+            --notes "手环原始数据原样上传版：心率(不平均)、血氧SpO2、压力、静息心率、体温、身体能量、PAI、睡眠分期、步数均按手环原始时间戳与数值上传到自建 health-mcp 服务器。\n\nAPK: app-mainline-debug.apk（小米手环9 等 Gadgetbridge 受支持设备）"
+
+      - name: Upload diagnostics
         if: always()
         uses: actions/upload-artifact@v4
         with:
