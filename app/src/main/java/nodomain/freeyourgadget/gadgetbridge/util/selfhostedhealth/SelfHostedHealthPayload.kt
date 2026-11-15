@@ -37,8 +37,12 @@ data class SelfHostedHealthPayloadSet(
 )
 
 /** One point of a non-activity time series (stress, SpO2, resting HR, ...) read from a
- *  `TimeSampleProvider`. [timestamp] is epoch seconds; [value] is the raw band reading. */
-data class TimeSamplePoint(val timestamp: Long, val value: Float)
+ *  `TimeSampleProvider`. [timestamp] is epoch seconds; [value] is the raw band reading.
+ *
+ *  [impedance] is only used by weight points: the scale reports a body impedance in the same
+ *  BLE frame as the weight, and the server needs it to derive body composition later. It is
+ *  null for every other series. */
+data class TimeSamplePoint(val timestamp: Long, val value: Float, val impedance: Int? = null)
 
 /**
  * Turns raw [ActivitySample]s into the JSON bodies the self-hosted health server ingests.
@@ -241,11 +245,14 @@ object SelfHostedHealthPayload {
             val body = bodies.getOrPut(date.toString()) { JSONObject().put("date", date.toString()) }
             val array = body.optJSONArray(key) ?: JSONArray().also { body.put(key, it) }
             for (point in points.sortedBy { it.timestamp }) {
-                array.put(
-                    JSONObject()
-                        .put("timestamp", formatTimestamp(point.timestamp, zone))
-                        .put("value", point.value)
-                )
+                val json = JSONObject()
+                    .put("timestamp", formatTimestamp(point.timestamp, zone))
+                    .put("value", point.value)
+                // Only weight points carry it; the server treats presence as "body impedance known".
+                if (point.impedance != null && point.impedance > 0) {
+                    json.put("impedance", point.impedance)
+                }
+                array.put(json)
             }
         }
         return bodies.map { (date, body) -> SelfHostedHealthDay(date, body) }

@@ -19,6 +19,7 @@ package nodomain.freeyourgadget.gadgetbridge.service.devices.miscale;
 
 import android.bluetooth.BluetoothGatt;
 import android.bluetooth.BluetoothGattCharacteristic;
+import android.database.sqlite.SQLiteDatabase;
 import android.os.Parcelable;
 import android.widget.Toast;
 
@@ -28,6 +29,7 @@ import org.slf4j.LoggerFactory;
 import java.util.Calendar;
 import java.util.Date;
 import java.util.GregorianCalendar;
+import java.util.TimeZone;
 import java.util.UUID;
 
 import nodomain.freeyourgadget.gadgetbridge.GBApplication;
@@ -131,13 +133,28 @@ public class MiCompositionScaleDeviceSupport extends AbstractBTLESingleDeviceSup
                 final int second = BLETypeConversions.toUnsigned(data, 8);
                 final Calendar c = GregorianCalendar.getInstance();
                 c.set(year, month - 1, day, hour, minute, second);
-                final Date date = c.getTime();
+                c.set(Calendar.MILLISECOND, 0);
+                // The app never sets this scale's clock, so it keeps running on UTC: the wall time it
+                // reports reads exactly one timezone offset earlier than "now". Correct only when the
+                // gap matches that offset within a small window, so a genuinely older weighing is not
+                // shifted by mistake.
+                Date date = c.getTime();
+                final long tzOffsetMs = TimeZone.getDefault().getOffset(System.currentTimeMillis());
+                if (tzOffsetMs != 0
+                        && Math.abs((System.currentTimeMillis() - date.getTime()) - tzOffsetMs) < 30 * 60 * 1000L) {
+                    date = new Date(date.getTime() + tzOffsetMs);
+                }
 
                 float weightKg = WeightMeasurement.weightToKg(
                         BLETypeConversions.toUint16(data, 11),
                         flags
                 );
-                handleWeightInfo(date, weightKg);
+
+                // Bit 1 marks a frame carrying the body impedance too; without it the two bytes at
+                // offset 9 are padding (00 00, or FE FF while the reading is not yet available).
+                final int impedance = testBit(flags, 1) ? BLETypeConversions.toUint16(data, 9) : -1;
+
+                handleWeightInfo(date, weightKg, impedance);
             }
 
             return true;
@@ -157,8 +174,8 @@ public class MiCompositionScaleDeviceSupport extends AbstractBTLESingleDeviceSup
         handleGBDeviceEvent(versionCmd);
     }
 
-    private void handleWeightInfo(final Date date, final float weightKg) {
-        LOG.info("GB_WEIGHT parsed ts={} weightKg={}", date, weightKg);
+    private void handleWeightInfo(final Date date, final float weightKg, final int impedance) {
+        LOG.info("GB_WEIGHT parsed ts={} weightKg={} impedance={}", date, weightKg, impedance);
         GB.toast(getContext().getString(R.string.weight_kg, weightKg), Toast.LENGTH_SHORT, GB.INFO);
 
         try (DBHandler db = GBApplication.acquireDB()) {
@@ -172,6 +189,18 @@ public class MiCompositionScaleDeviceSupport extends AbstractBTLESingleDeviceSup
                     userId,
                     weightKg
             ));
+
+            // Body impedance goes into its own side table instead of a column on MiScaleWeightSample:
+            // adding a column there needs a GreenDAO schema bump plus a migration, and a bad migration
+            // would cost the whole database. Plain SQL keeps it invisible to the generated DAOs.
+            if (impedance > 0) {
+                final SQLiteDatabase database = db.getDatabase();
+                database.execSQL("CREATE TABLE IF NOT EXISTS MI_SCALE_IMPEDANCE ("
+                        + "TIMESTAMP INTEGER PRIMARY KEY, IMPEDANCE INTEGER NOT NULL)");
+                database.execSQL(
+                        "INSERT OR REPLACE INTO MI_SCALE_IMPEDANCE (TIMESTAMP, IMPEDANCE) VALUES (?, ?)",
+                        new Object[]{date.getTime(), impedance});
+            }
         } catch (final Exception e) {
             LOG.error("Error saving weight sample", e);
         }

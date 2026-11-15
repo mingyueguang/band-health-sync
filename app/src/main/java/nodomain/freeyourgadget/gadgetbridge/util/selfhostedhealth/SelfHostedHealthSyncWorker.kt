@@ -26,6 +26,8 @@ import androidx.work.Worker
 import androidx.work.WorkerParameters
 import nodomain.freeyourgadget.gadgetbridge.GBApplication
 import nodomain.freeyourgadget.gadgetbridge.R
+import nodomain.freeyourgadget.gadgetbridge.database.DBHandler
+import nodomain.freeyourgadget.gadgetbridge.database.DBHelper
 import nodomain.freeyourgadget.gadgetbridge.devices.TimeSampleProvider
 import nodomain.freeyourgadget.gadgetbridge.impl.GBDevice
 import nodomain.freeyourgadget.gadgetbridge.model.ActivitySample
@@ -135,6 +137,14 @@ class SelfHostedHealthSyncWorker(
                 val weights = readWeightSamples(device, windowStart, now)
                 if (weights.isNotEmpty()) {
                     val days = SelfHostedHealthPayload.attachTimeSamples(built.days, "weight", weights, zone)
+                    built = SelfHostedHealthPayloadSet(days, built.sleepUploadedThrough)
+                }
+                // Manual measurements are stored in the band's own table and have no usable provider:
+                // the coordinator's getHeartRateManualSampleProvider is still an upstream TODO that
+                // falls through to the empty base implementation. Read them straight from the table.
+                val manualHeartRate = readManualHeartRate(device, windowStart, now)
+                if (manualHeartRate.isNotEmpty()) {
+                    val days = SelfHostedHealthPayload.attachTimeSamples(built.days, "manual_hr", manualHeartRate, zone)
                     built = SelfHostedHealthPayloadSet(days, built.sleepUploadedThrough)
                 }
                 payload = SelfHostedWorkoutSync.attach(
@@ -297,12 +307,78 @@ class SelfHostedHealthSyncWorker(
             @Suppress("UNCHECKED_CAST")
             val samples = (provider as TimeSampleProvider<TimeSample>)
                 .getAllSamples(fromTs * 1000L, toTs * 1000L)
+            val impedances = readBodyImpedance(db, fromTs, toTs)
             val points = mutableListOf<TimeSamplePoint>()
             for (sample in samples) {
                 val weight = (sample as? WeightSample)?.getWeightKg()
                 if (weight != null && weight > 0f) {
-                    points.add(TimeSamplePoint(sample.timestamp / 1000L, weight))
+                    points.add(
+                        TimeSamplePoint(
+                            sample.timestamp / 1000L,
+                            weight,
+                            impedances[sample.timestamp.toLong()]
+                        )
+                    )
                 }
+            }
+            points
+        }
+    }
+
+    /**
+     * Body impedance, written by MiCompositionScaleDeviceSupport when a settled weighing frame
+     * carries one. That class creates the table lazily on first use, so it may not exist yet and a
+     * missing table is not an error.
+     */
+    private fun readBodyImpedance(db: DBHandler, fromTs: Long, toTs: Long): Map<Long, Int> {
+        val result = mutableMapOf<Long, Int>()
+        try {
+            db.database.rawQuery(
+                "SELECT TIMESTAMP, IMPEDANCE FROM MI_SCALE_IMPEDANCE WHERE TIMESTAMP BETWEEN ? AND ?",
+                arrayOf((fromTs * 1000L).toString(), (toTs * 1000L).toString())
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val impedance = cursor.getInt(1)
+                    if (impedance > 0) {
+                        result[cursor.getLong(0)] = impedance
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            LOG.warn("Could not read body impedance table", e)
+        }
+        return result
+    }
+
+    /**
+     * Manual measurements the band recorded on request (TYPE 0x11 = heart rate). Only heart rate is
+     * uploaded here: SpO2 already arrives through its own provider, and stress/temperature have
+     * dedicated sources in the Xiaomi coordinator.
+     */
+    private fun readManualHeartRate(device: GBDevice, fromTs: Long, toTs: Long): List<TimeSamplePoint> {
+        return GBApplication.acquireDbReadOnly().use { db ->
+            val deviceId = runCatching { DBHelper.getDevice(device, db.daoSession).id }.getOrNull()
+                ?: return@use emptyList()
+            val points = mutableListOf<TimeSamplePoint>()
+            try {
+                db.database.rawQuery(
+                    "SELECT TIMESTAMP, VALUE FROM XIAOMI_MANUAL_SAMPLE WHERE DEVICE_ID = ? AND TYPE = 17" +
+                        " AND TIMESTAMP BETWEEN ? AND ? ORDER BY TIMESTAMP",
+                    arrayOf(
+                        deviceId.toString(),
+                        (fromTs * 1000L).toString(),
+                        (toTs * 1000L).toString()
+                    )
+                ).use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val value = cursor.getInt(1)
+                        if (value > 0) {
+                            points.add(TimeSamplePoint(cursor.getLong(0) / 1000L, value.toFloat()))
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                LOG.warn("Could not read manual heart rate samples", e)
             }
             points
         }
