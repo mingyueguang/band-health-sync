@@ -36,6 +36,7 @@ import nodomain.freeyourgadget.gadgetbridge.model.Spo2Sample
 import nodomain.freeyourgadget.gadgetbridge.model.StressSample
 import nodomain.freeyourgadget.gadgetbridge.model.TemperatureSample
 import nodomain.freeyourgadget.gadgetbridge.model.TimeSample
+import nodomain.freeyourgadget.gadgetbridge.model.WeightSample
 import nodomain.freeyourgadget.gadgetbridge.util.GBPrefs
 import nodomain.freeyourgadget.gadgetbridge.util.cycle.CycleContextStore
 import nodomain.freeyourgadget.gadgetbridge.util.cycle.CycleContextSyncWorker
@@ -126,6 +127,14 @@ class SelfHostedHealthSyncWorker(
                 var built = SelfHostedHealthPayload.build(samples, zone, sleepCursor, now)
                 for ((key, points) in timeSeries) {
                     val days = SelfHostedHealthPayload.attachTimeSamples(built.days, key, points, zone)
+                    built = SelfHostedHealthPayloadSet(days, built.sleepUploadedThrough)
+                }
+                // A scale stores no activity samples, so the loop above leaves it with an empty
+                // payload and nothing of it ever reaches the server. Reading its own weight series
+                // is the only thing that gives it something to send.
+                val weights = readWeightSamples(device, windowStart, now)
+                if (weights.isNotEmpty()) {
+                    val days = SelfHostedHealthPayload.attachTimeSamples(built.days, "weight", weights, zone)
                     built = SelfHostedHealthPayloadSet(days, built.sleepUploadedThrough)
                 }
                 payload = SelfHostedWorkoutSync.attach(
@@ -261,6 +270,9 @@ class SelfHostedHealthSyncWorker(
             readSeries("resting_hr", coordinator.getHeartRateRestingSampleProvider(device, session)) {
                 (it as? HeartRateSample)?.getHeartRate()?.toFloat()
             }
+            readSeries("manual_hr", coordinator.getHeartRateManualSampleProvider(device, session)) {
+                (it as? HeartRateSample)?.getHeartRate()?.toFloat()
+            }
             readSeries("temperature", coordinator.getTemperatureSampleProvider(device, session)) {
                 (it as? TemperatureSample)?.getTemperature()
             }
@@ -272,6 +284,28 @@ class SelfHostedHealthSyncWorker(
             }
         }
         return result
+    }
+
+    /**
+     * Reads the weight series of a device that exposes one (the Mi scales do). Values are kept as
+     * the scale reported them; zero or absent readings are dropped like every other series.
+     */
+    private fun readWeightSamples(device: GBDevice, fromTs: Long, toTs: Long): List<TimeSamplePoint> {
+        return GBApplication.acquireDbReadOnly().use { db ->
+            val provider = device.deviceCoordinator.getWeightSampleProvider(device, db.daoSession)
+                ?: return@use emptyList()
+            @Suppress("UNCHECKED_CAST")
+            val samples = (provider as TimeSampleProvider<TimeSample>)
+                .getAllSamples(fromTs * 1000L, toTs * 1000L)
+            val points = mutableListOf<TimeSamplePoint>()
+            for (sample in samples) {
+                val weight = (sample as? WeightSample)?.getWeightKg()
+                if (weight != null && weight > 0f) {
+                    points.add(TimeSamplePoint(sample.timestamp / 1000L, weight))
+                }
+            }
+            points
+        }
     }
 
     private fun selectedDevices(prefs: GBPrefs, requestedAddress: String?): List<GBDevice> {
@@ -322,7 +356,7 @@ class SelfHostedHealthSyncWorker(
         count += body.optJSONArray("heart_rate")?.length() ?: 0
         count += body.optJSONArray("sleep")?.length() ?: 0
         count += body.optJSONArray("workouts")?.length() ?: 0
-        for (key in arrayOf("stress", "spo2", "resting_hr", "temperature", "body_energy", "pai")) {
+        for (key in arrayOf("stress", "spo2", "resting_hr", "manual_hr", "temperature", "body_energy", "pai", "weight")) {
             count += body.optJSONArray(key)?.length() ?: 0
         }
         return count
