@@ -107,7 +107,10 @@ object SelfHostedHealthPayload {
         // Distance and active calories come from the same activity samples and are harmless to
         // re-send: the server keeps the larger per-day total, exactly like steps.
         val distanceByDate = LinkedHashMap<LocalDate, Long>()
-        val caloriesByDate = LinkedHashMap<LocalDate, Long>()
+        // XiaomiSampleProvider#convertCalories multiplies every sample by 1000, so these accumulators
+        // hold thousandths of a kcal. They are divided once, after the loop: rounding each sample
+        // separately would round almost every reading down to zero on a quiet day.
+        val caloriesRawByDate = LinkedHashMap<LocalDate, Long>()
         // date -> raw heart-rate points: (original timestamp, original bpm), no bucketing.
         val heartRateByDate = LinkedHashMap<LocalDate, MutableList<Pair<Long, Int>>>()
 
@@ -127,7 +130,7 @@ object SelfHostedHealthPayload {
 
             val activeCalories = sample.activeCalories
             if (activeCalories > 0) {
-                caloriesByDate[date] = (caloriesByDate[date] ?: 0L) + activeCalories.toLong()
+                caloriesRawByDate[date] = (caloriesRawByDate[date] ?: 0L) + activeCalories.toLong()
             }
 
             // Same validity rule the Health Connect path uses: 255 is Gadgetbridge's documented
@@ -174,7 +177,7 @@ object SelfHostedHealthPayload {
         val dates = sortedSetOf<LocalDate>().apply {
             addAll(stepsByDate.keys)
             addAll(distanceByDate.keys)
-            addAll(caloriesByDate.keys)
+            addAll(caloriesRawByDate.keys)
             addAll(heartRateByDate.keys)
             addAll(sleepByDate.keys)
         }
@@ -189,8 +192,12 @@ object SelfHostedHealthPayload {
             distanceByDate[date]?.let { totalCm ->
                 body.put("distance", JSONObject().put("total_cm", totalCm))
             }
-            caloriesByDate[date]?.let { total ->
-                body.put("active_calories", JSONObject().put("total", total))
+            caloriesRawByDate[date]?.let { raw ->
+                // Thousandths of a kcal in, whole kcal out, rounded once.
+                val kcal = (raw + 500L) / 1000L
+                if (kcal > 0) {
+                    body.put("active_calories", JSONObject().put("total", kcal))
+                }
             }
             heartRateByDate[date]?.let { points ->
                 val array = JSONArray()
@@ -254,6 +261,29 @@ object SelfHostedHealthPayload {
                 }
                 array.put(json)
             }
+        }
+        return bodies.map { (date, body) -> SelfHostedHealthDay(date, body) }
+    }
+
+    /**
+     * Merges the band's own daily rollup into the per-day bodies. The values arrive already
+     * computed and already filtered (see the worker), so they are placed as-is; a day that had
+     * nothing but a summary still becomes a body of its own.
+     */
+    fun attachDailySummaries(
+        days: List<SelfHostedHealthDay>,
+        summaries: Map<LocalDate, JSONObject>
+    ): List<SelfHostedHealthDay> {
+        if (summaries.isEmpty()) {
+            return days
+        }
+        val bodies = LinkedHashMap<String, JSONObject>()
+        for (day in days) {
+            bodies[day.date] = day.body
+        }
+        for ((date, summary) in summaries) {
+            val body = bodies.getOrPut(date.toString()) { JSONObject().put("date", date.toString()) }
+            body.put("daily_summary", summary)
         }
         return bodies.map { (date, body) -> SelfHostedHealthDay(date, body) }
     }

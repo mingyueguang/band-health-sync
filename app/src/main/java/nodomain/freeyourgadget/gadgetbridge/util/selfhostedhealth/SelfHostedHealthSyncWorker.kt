@@ -17,6 +17,7 @@
 package nodomain.freeyourgadget.gadgetbridge.util.selfhostedhealth
 
 import android.content.Context
+import android.database.Cursor
 import androidx.work.Constraints
 import androidx.work.ExistingPeriodicWorkPolicy
 import androidx.work.NetworkType
@@ -46,6 +47,7 @@ import org.json.JSONException
 import org.json.JSONObject
 import org.slf4j.LoggerFactory
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
@@ -147,6 +149,14 @@ class SelfHostedHealthSyncWorker(
                     val days = SelfHostedHealthPayload.attachTimeSamples(built.days, "manual_hr", manualHeartRate, zone)
                     built = SelfHostedHealthPayloadSet(days, built.sleepUploadedThrough)
                 }
+                // The band's own daily rollup. Resting heart rate, heart-rate extremes with their
+                // timestamps, SpO2 and stress ranges, training load, vitality and recovery hours are
+                // computed on the device and only exist here; the raw samples cannot reconstruct them.
+                val dailySummaries = readDailySummary(device, windowStart, now, zone)
+                if (dailySummaries.isNotEmpty()) {
+                    val days = SelfHostedHealthPayload.attachDailySummaries(built.days, dailySummaries)
+                    built = SelfHostedHealthPayloadSet(days, built.sleepUploadedThrough)
+                }
                 payload = SelfHostedWorkoutSync.attach(
                     built, { SelfHostedWorkoutReader.read(device, windowStart, now) }, zone, now,
                     prefs.getBoolean(GBPrefs.SELF_HOSTED_HEALTH_WORKOUTS_ENABLED, false)
@@ -234,7 +244,10 @@ class SelfHostedHealthSyncWorker(
             val provider = device.deviceCoordinator.getSampleProvider(device, db.daoSession)
                 ?: return@use emptyList()
             @Suppress("UNCHECKED_CAST")
-            provider.getAllActivitySamples(fromTs.toInt(), toTs.toInt()) as List<ActivitySample>
+            provider.getAllActivitySamples(
+                fromTs.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt(),
+                toTs.coerceIn(0L, Int.MAX_VALUE.toLong()).toInt()
+            ) as List<ActivitySample>
         }
     }
 
@@ -278,9 +291,6 @@ class SelfHostedHealthSyncWorker(
                 (it as? Spo2Sample)?.getSpo2()?.toFloat()
             }
             readSeries("resting_hr", coordinator.getHeartRateRestingSampleProvider(device, session)) {
-                (it as? HeartRateSample)?.getHeartRate()?.toFloat()
-            }
-            readSeries("manual_hr", coordinator.getHeartRateManualSampleProvider(device, session)) {
                 (it as? HeartRateSample)?.getHeartRate()?.toFloat()
             }
             readSeries("temperature", coordinator.getTemperatureSampleProvider(device, session)) {
@@ -381,6 +391,93 @@ class SelfHostedHealthSyncWorker(
                 LOG.warn("Could not read manual heart rate samples", e)
             }
             points
+        }
+    }
+
+    /**
+     * The band's own daily rollup, read straight from XIAOMI_DAILY_SUMMARY_SAMPLE. Every value here
+     * is what the band itself computed; nothing is derived on the phone. A column the band left
+     * empty or zero means "not measured" and is skipped instead of uploaded as a real reading.
+     *
+     * STANDING is deliberately not copied: the band stores it as an opaque bitfield (10485760 on an
+     * ordinary day), not as minutes, so treating it as a duration would report a wrong number.
+     */
+    private fun readDailySummary(
+        device: GBDevice,
+        fromTs: Long,
+        toTs: Long,
+        zone: ZoneId
+    ): Map<LocalDate, JSONObject> {
+        val result = mutableMapOf<LocalDate, JSONObject>()
+        GBApplication.acquireDbReadOnly().use { db ->
+            val deviceId = runCatching { DBHelper.getDevice(device, db.daoSession).id }.getOrNull()
+                ?: return@use
+            try {
+                db.database.rawQuery(
+                    "SELECT * FROM XIAOMI_DAILY_SUMMARY_SAMPLE WHERE DEVICE_ID = ?" +
+                        " AND TIMESTAMP BETWEEN ? AND ? ORDER BY TIMESTAMP",
+                    arrayOf(
+                        deviceId.toString(),
+                        (fromTs * 1000L).toString(),
+                        (toTs * 1000L).toString()
+                    )
+                ).use { cursor ->
+                    while (cursor.moveToNext()) {
+                        val timestampMs = cursor.getLong(cursor.getColumnIndexOrThrow("TIMESTAMP"))
+                        val date = Instant.ofEpochMilli(timestampMs).atZone(zone).toLocalDate()
+                        val json = JSONObject()
+                        copyInt(cursor, json, "STEPS", "steps")
+                        copyInt(cursor, json, "HR_RESTING", "hr_resting")
+                        copyInt(cursor, json, "HR_MAX", "hr_max")
+                        copyEpochSecond(cursor, json, "HR_MAX_TS", "hr_max_at")
+                        copyInt(cursor, json, "HR_MIN", "hr_min")
+                        copyEpochSecond(cursor, json, "HR_MIN_TS", "hr_min_at")
+                        copyInt(cursor, json, "HR_AVG", "hr_avg")
+                        copyInt(cursor, json, "STRESS_AVG", "stress_avg")
+                        copyInt(cursor, json, "STRESS_MAX", "stress_max")
+                        copyInt(cursor, json, "STRESS_MIN", "stress_min")
+                        copyInt(cursor, json, "SPO2_MAX", "spo2_max")
+                        copyEpochSecond(cursor, json, "SPO2_MAX_TS", "spo2_max_at")
+                        copyInt(cursor, json, "SPO2_MIN", "spo2_min")
+                        copyInt(cursor, json, "SPO2_AVG", "spo2_avg")
+                        copyInt(cursor, json, "ACTIVE_CALORIES", "active_calories")
+                        copyInt(cursor, json, "TRAINING_LOAD_DAY", "training_load_day")
+                        copyInt(cursor, json, "TRAINING_LOAD_WEEK", "training_load_week")
+                        copyInt(cursor, json, "TRAINING_LOAD_LEVEL", "training_load_level")
+                        copyInt(cursor, json, "VITALITY_CURRENT", "vitality_current")
+                        copyInt(cursor, json, "RECOVERY_HOURS", "recovery_hours")
+                        if (json.length() > 0) {
+                            result[date] = json
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                LOG.warn("Could not read daily summary", e)
+            }
+        }
+        return result
+    }
+
+    private fun copyInt(cursor: Cursor, json: JSONObject, column: String, key: String) {
+        val index = cursor.getColumnIndex(column)
+        if (index < 0 || cursor.isNull(index)) {
+            return
+        }
+        val value = cursor.getInt(index)
+        if (value > 0) {
+            json.put(key, value)
+        }
+    }
+
+    private fun copyEpochSecond(cursor: Cursor, json: JSONObject, column: String, key: String) {
+        val index = cursor.getColumnIndex(column)
+        if (index < 0 || cursor.isNull(index)) {
+            return
+        }
+        val value = cursor.getLong(index)
+        // Epoch seconds on the band side; anything outside that range is not a usable timestamp.
+        if (value in 1_000_000_000L..2_000_000_000L) {
+            json.put(key, value)
         }
     }
 
