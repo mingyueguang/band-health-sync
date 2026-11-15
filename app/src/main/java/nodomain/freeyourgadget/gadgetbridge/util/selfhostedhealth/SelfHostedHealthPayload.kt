@@ -100,6 +100,10 @@ object SelfHostedHealthPayload {
         val sorted = samples.sortedBy { it.timestamp }
 
         val stepsByDate = LinkedHashMap<LocalDate, Long>()
+        // Distance and active calories come from the same activity samples and are harmless to
+        // re-send: the server keeps the larger per-day total, exactly like steps.
+        val distanceByDate = LinkedHashMap<LocalDate, Long>()
+        val caloriesByDate = LinkedHashMap<LocalDate, Long>()
         // date -> raw heart-rate points: (original timestamp, original bpm), no bucketing.
         val heartRateByDate = LinkedHashMap<LocalDate, MutableList<Pair<Long, Int>>>()
 
@@ -110,6 +114,16 @@ object SelfHostedHealthPayload {
             val steps = sample.steps
             if (steps > 0) {
                 stepsByDate[date] = (stepsByDate[date] ?: 0L) + steps
+            }
+
+            val distanceCm = sample.distanceCm
+            if (distanceCm > 0) {
+                distanceByDate[date] = (distanceByDate[date] ?: 0L) + distanceCm.toLong()
+            }
+
+            val activeCalories = sample.activeCalories
+            if (activeCalories > 0) {
+                caloriesByDate[date] = (caloriesByDate[date] ?: 0L) + activeCalories.toLong()
             }
 
             // Same validity rule the Health Connect path uses: 255 is Gadgetbridge's documented
@@ -132,7 +146,11 @@ object SelfHostedHealthPayload {
             }
             val start = stages.first().start
             val end = stages.last().end
-            if (end > dataHorizon || end <= sleepUploadedThrough) {
+            // Only an unfinished night is held back. The cursor is deliberately NOT applied here:
+            // it tracks the newest session end, so filtering on it silently dropped every nap earlier
+            // in the window. The server merges sessions by overlap and keeps the most complete span,
+            // which makes re-sending a whole night harmless.
+            if (end > dataHorizon) {
                 continue
             }
             // Match the app's own convention (DailyTotals, widget, charts): the reported duration is
@@ -151,6 +169,8 @@ object SelfHostedHealthPayload {
 
         val dates = sortedSetOf<LocalDate>().apply {
             addAll(stepsByDate.keys)
+            addAll(distanceByDate.keys)
+            addAll(caloriesByDate.keys)
             addAll(heartRateByDate.keys)
             addAll(sleepByDate.keys)
         }
@@ -161,6 +181,12 @@ object SelfHostedHealthPayload {
 
             stepsByDate[date]?.let { total ->
                 body.put("steps", JSONObject().put("total", total))
+            }
+            distanceByDate[date]?.let { totalCm ->
+                body.put("distance", JSONObject().put("total_cm", totalCm))
+            }
+            caloriesByDate[date]?.let { total ->
+                body.put("active_calories", JSONObject().put("total", total))
             }
             heartRateByDate[date]?.let { points ->
                 val array = JSONArray()
