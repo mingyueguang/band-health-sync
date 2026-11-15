@@ -97,8 +97,29 @@ public class MiCompositionScaleDeviceSupport extends AbstractBTLESingleDeviceSup
         }
 
         final UUID characteristicUUID = characteristic.getUuid();
+
+        // === GB_DEBUG: 原始数据帧抓包（用于分析体脂/阻抗字段）===
+        if (data != null) {
+            final StringBuilder hex = new StringBuilder();
+            final StringBuilder dec = new StringBuilder();
+            for (int i = 0; i < data.length; i++) {
+                hex.append(String.format("%02X ", data[i] & 0xFF));
+                dec.append(String.format("[%d]=%d ", i, data[i] & 0xFF));
+            }
+            LOG.info("GB_RAW uuid={} len={} hex={}", characteristicUUID, data.length, hex.toString().trim());
+            LOG.info("GB_RAW uuid={} bytes={}", characteristicUUID, dec.toString().trim());
+        }
+        // === GB_DEBUG END ===
+
         if (characteristicUUID.equals(GattCharacteristic.UUID_CHARACTERISTIC_BODY_COMPOSITION_MEASUREMENT)) {
             final byte flags = data[1];
+
+            // === GB_DEBUG: flags 每一位的含义 ===
+            LOG.info("GB_FLAGS raw=0x{} b0_fat={} b1_uid={} b2_bmr={} b3_impedance={} b4_weight={} b5_height={} b6_multi={} b7_unstable={}",
+                    String.format("%02X", flags),
+                    testBit(flags, 0), testBit(flags, 1), testBit(flags, 2), testBit(flags, 3),
+                    testBit(flags, 4), testBit(flags, 5), testBit(flags, 6), testBit(flags, 7));
+            // === GB_DEBUG END ===
             final boolean stabilized = testBit(flags, 5) && !testBit(flags, 7);
 
             if (stabilized) {
@@ -137,6 +158,7 @@ public class MiCompositionScaleDeviceSupport extends AbstractBTLESingleDeviceSup
     }
 
     private void handleWeightInfo(final Date date, final float weightKg) {
+        LOG.info("GB_WEIGHT parsed ts={} weightKg={}", date, weightKg);
         GB.toast(getContext().getString(R.string.weight_kg, weightKg), Toast.LENGTH_SHORT, GB.INFO);
 
         try (DBHandler db = GBApplication.acquireDB()) {
